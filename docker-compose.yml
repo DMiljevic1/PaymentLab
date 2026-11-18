@@ -165,6 +165,7 @@ services:
     volumes:
       - payments-db-data:/var/lib/postgresql
       - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./seed:/seed:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
       interval: 5s
@@ -205,6 +206,7 @@ services:
     volumes:
       - wallet-db-data:/var/lib/postgresql
       - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./seed:/seed:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
       interval: 5s
@@ -292,6 +294,8 @@ services:
   loki:
     image: ${LOKI_IMAGE}
     command: ["-config.file=/etc/loki/loki.yaml"]
+    environment:
+      GOMEMLIMIT: 300MiB
     volumes:
       - ./infra/loki/loki.yaml:/etc/loki/loki.yaml:ro
       - loki-data:/loki
@@ -306,6 +310,8 @@ services:
     image: ${TEMPO_IMAGE}
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     user: "0"   # the named volume is created root-owned
+    environment:
+      GOMEMLIMIT: 400MiB   # GC harder before reaching the container limit
     volumes:
       - ./infra/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
       - tempo-data:/var/tempo
@@ -407,6 +413,28 @@ services:
         limits: { cpus: "${CADVISOR_CPUS}", memory: "${CADVISOR_MEM}" }
     logging: *logging
     restart: unless-stopped
+
+  # ------------------------------------------------------------------ load generator (on demand)
+  # Not started by "up"; ./lab.ps1 load runs it with: docker compose --profile load run --rm k6 ...
+  k6:
+    image: ${K6_IMAGE}
+    profiles: ["load"]
+    environment:
+      BASE_URL: http://gateway:8080
+      K6_NO_USAGE_REPORT: "true"
+      K6_OTEL_EXPORTER_TYPE: grpc
+      K6_OTEL_GRPC_EXPORTER_ENDPOINT: otel-collector:4317
+      K6_OTEL_GRPC_EXPORTER_INSECURE: "true"
+      K6_OTEL_SERVICE_NAME: k6
+      K6_OTEL_METRIC_PREFIX: k6_
+      K6_OTEL_EXPORT_INTERVAL: 5s
+    volumes:
+      - ./load:/load
+    working_dir: /load/k6
+    deploy:
+      resources:
+        limits: { cpus: "${K6_CPUS}", memory: "${K6_MEM}" }
+    logging: *logging
 
 volumes:
   payments-db-data:

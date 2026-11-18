@@ -501,6 +501,48 @@ def containers():
     return dashboard("paymentlab-containers", "PaymentLab · Containers", p, "cAdvisor: CPU, throttling, memory, restarts per container.", variables)
 
 
+def k6():
+    pct = lambda m, by, p_: f'histogram_quantile({p_}, sum by (le{by}) (rate({m}_bucket[{RI}])))'
+    p = [
+        row("Load generator (k6) - client view"),
+        stat("Requests / s", f'sum(rate(k6_http_reqs_total[{RI}])) or vector(0)', "reqps", w=3, decimals=1),
+        stat("Failed requests", ratio(f'sum(rate(k6_http_req_failed_total{{condition="nonzero"}}[{RI}]))', f'sum(rate(k6_http_reqs_total[{RI}]))'),
+             "percentunit", w=3, decimals=2, steps=thr(("green", None), ("orange", 0.01), ("red", 0.05))),
+        stat("Request p95", pct("k6_http_req_duration_milliseconds", "", 0.95), "ms", w=3, steps=thr(("green", None), ("orange", 500), ("red", 2000))),
+        stat("Payment E2E p95", pct("k6_payment_e2e_duration_milliseconds", "", 0.95), "ms", w=3, steps=thr(("green", None), ("orange", 3000), ("red", 10000))),
+        stat("Active VUs", 'sum(k6_vus) or vector(0)', w=3),
+        stat("Client retries / s", f'sum(rate(k6_client_retries_total[{RI}])) or vector(0)', "reqps", w=3, decimals=2,
+             steps=thr(("green", None), ("orange", 0.1), ("red", 1))),
+        stat("Unfinished payments", 'sum(k6_payments_unfinished_total) or vector(0)', w=3, steps=thr(("green", None), ("red", 1)),
+             desc="Payments the client stopped polling (not final within POLL_TIMEOUT_S)."),
+        stat("Dropped iterations", 'sum(k6_dropped_iterations_total) or vector(0)', w=3, steps=thr(("green", None), ("orange", 1)),
+             desc="The arrival-rate executor ran out of VUs: the system is too slow for the requested rate."),
+        ts("Requests / s by endpoint and status", [q(f'sum by (name, status) (rate(k6_http_reqs_total[{RI}]))', "{{name}} {{status}}")],
+           unit="reqps", w=12),
+        ts("Request latency p95 by endpoint", [q(pct("k6_http_req_duration_milliseconds", ", name", 0.95), "{{name}}")], unit="ms", w=12),
+        ts("Payment end-to-end time (create -> final, client side)",
+           [q(pct("k6_payment_e2e_duration_milliseconds", ", type", p_), f"p{int(p_ * 100)} {{{{type}}}}") for p_ in (0.5, 0.95, 0.99)],
+           unit="ms", w=12),
+        ts("Payments by final status (client side)", [q(f'sum by (type, status) (rate(k6_payments_final_total[{RI}]))', "{{type}} {{status}}"),
+                                                      q(f'sum by (type) (rate(k6_payments_unfinished_total[{RI}]))', "unfinished {{type}}"),
+                                                      q(f'sum by (status) (rate(k6_payment_create_failed_total[{RI}]))', "create failed {{status}}")],
+           unit="reqps", w=12),
+        ts("Client retries by reason", [q(f'sum by (name, reason) (rate(k6_client_retries_total[{RI}]))', "{{name}} {{reason}}")], unit="reqps", w=8),
+        ts("Iterations / s and dropped", [q(f'sum(rate(k6_iterations_total[{RI}]))', "iterations"),
+                                          q(f'sum(rate(k6_dropped_iterations_total[{RI}]))', "dropped")], unit="ops", w=8),
+        ts("Virtual users", [q('sum(k6_vus)', "active"), q('sum(k6_vus_max)', "allocated")], w=8),
+        row("System side (same time range)"),
+        ts("Gateway requests / s by status", [q(f'sum by (http_response_status_code) (rate(http_server_request_duration_seconds_count{{job="gateway"}}[{RI}]))',
+                                                "{{http_response_status_code}}")], unit="reqps", w=8, stack=True),
+        ts("Payments in flight by saga state", [q('sum by (state) (payments_by_state)', "{{state}}")], w=8, stack=True, fill=40),
+        ts("Container CPU (% of limit)",
+           [q(f'sum by (service) (rate(container_cpu_usage_seconds_total{{service=~"gateway|payments|wallet|connector|payments-db|wallet-db|rabbitmq"}}[{RI}])) '
+              f'/ (max by (service) (container_spec_cpu_quota{{service!=""}}) / max by (service) (container_spec_cpu_period{{service!=""}}))', "{{service}}")],
+           unit="percentunit", w=8),
+    ]
+    return dashboard("paymentlab-k6", "PaymentLab · Load (k6)", p, "What the load generator sees, next to the system.", time_from="now-15m")
+
+
 DASHBOARDS = {
     "overview.json": overview,
     "gateway.json": gateway,
@@ -511,6 +553,7 @@ DASHBOARDS = {
     "rabbitmq.json": rabbitmq,
     "postgres.json": postgres,
     "containers.json": containers,
+    "k6.json": k6,
 }
 
 if __name__ == "__main__":

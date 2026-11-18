@@ -15,6 +15,7 @@ distributor:
 
 ingester:
   max_block_duration: 5m
+  max_block_bytes: 104857600   # cut blocks at 100 MB to keep memory bounded
 
 compactor:
   compaction:
@@ -43,7 +44,7 @@ storage:
 overrides:
   defaults:
     metrics_generator:
-      processors: [service-graphs, span-metrics, local-blocks]
+      processors: [service-graphs, span-metrics]
 
 usage_report:
   reporting_enabled: false
