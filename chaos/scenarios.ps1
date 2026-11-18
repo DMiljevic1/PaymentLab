@@ -4,7 +4,8 @@
 #         Ticket (what support / alerting reports; {0} = start time), Hints (3, progressively more specific),
 #         RootCause, Explanation, Fix, Inject / Resolve (scriptblocks, $State is a hashtable persisted in
 #         chaos/.state), Check (scriptblock, $true once the symptom is visible; used by chaos/verify.ps1),
-#         SettleSeconds (how long verify.ps1 waits before it starts checking).
+#         SettleSeconds (how long verify.ps1 waits before it starts checking), LoadFirst (start the
+#         background traffic before injecting).
 
 @(
     # ------------------------------------------------------------------------------------------ 1
@@ -32,7 +33,7 @@ Impact: all customers, all payment types.
 
     # ------------------------------------------------------------------------------------------ 2
     @{
-        Id = 2; Title = 'Forgotten transaction holding row locks'; Category = 'databases'; Difficulty = 'medium'; Severity = 'SEV-2'; Load = 20
+        Id = 2; Title = 'Forgotten transaction holding row locks'; Category = 'databases'; Difficulty = 'medium'; Severity = 'SEV-2'; Load = 20; LoadFirst = $true
         Ticket = @'
 Customer support, {0}: some customers (not all) cannot pay. Their payments stay "Pending" for a long
 time and then end as "Failed" or "Under review". Other customers pay normally. The affected customers

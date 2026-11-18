@@ -65,8 +65,15 @@ function Start-Incident {
     # Saved before injecting, so resolve can clean up even if injection fails half-way.
     $state.openedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     Save-State $state
-    & $s.Inject $state
-    if ($s.Load -gt 0) { Start-Traffic 'traffic-1' 'main.js' @{ SCENARIO = 'steady'; RATE = $s.Load; DURATION = '6h' } }
+    # Usually the fault goes in first; LoadFirst scenarios need the customers' accounts to exist already.
+    if ($s.LoadFirst) {
+        Start-Traffic 'traffic-1' 'main.js' @{ SCENARIO = 'steady'; RATE = $s.Load; DURATION = '6h' }
+        Start-Sleep -Seconds 20
+        & $s.Inject $state
+    } else {
+        & $s.Inject $state
+        if ($s.Load -gt 0) { Start-Traffic 'traffic-1' 'main.js' @{ SCENARIO = 'steady'; RATE = $s.Load; DURATION = '6h' } }
+    }
     $state.openedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     $state.rootCause = $s.RootCause
     $state.explanation = $s.Explanation
