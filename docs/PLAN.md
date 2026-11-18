@@ -1,6 +1,6 @@
 # PaymentLab – Build Plan
 
-> Status: approved; Phases 1–3 done.
+> Status: approved; all phases done. See README.md for usage.
 > This plan deliberately does not describe the lab's deliberate weaknesses or fault scenarios.
 
 ## 1. Goal
