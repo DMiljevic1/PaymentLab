@@ -1,0 +1,8 @@
+[
+  { "name": "payments-db",        "listen": "0.0.0.0:15432", "upstream": "payments-db:5432", "enabled": true },
+  { "name": "wallet-db",          "listen": "0.0.0.0:25432", "upstream": "wallet-db:5432",   "enabled": true },
+  { "name": "rabbitmq-payments",  "listen": "0.0.0.0:35672", "upstream": "rabbitmq:5672",    "enabled": true },
+  { "name": "rabbitmq-connector", "listen": "0.0.0.0:35673", "upstream": "rabbitmq:5672",    "enabled": true },
+  { "name": "wallet-http",        "listen": "0.0.0.0:18082", "upstream": "wallet:8080",      "enabled": true },
+  { "name": "fakebank-http",      "listen": "0.0.0.0:18090", "upstream": "fakebank:8080",    "enabled": true }
+]

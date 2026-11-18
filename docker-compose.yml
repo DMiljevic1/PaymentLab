@@ -1,0 +1,246 @@
+﻿# PaymentLab â€“ all services. Start with ./lab.ps1 up
+# Resource limits and tuning knobs come from .env (see there).
+#
+# Services talk to their dependencies THROUGH toxiproxy (ports 15432, 25432, 35672/35673, 18082, 18090),
+# so network faults can be injected without code changes. Host ports below are for you (psql, UI, Swagger).
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
+services:
+  # ------------------------------------------------------------------ edge
+  gateway:
+    build:
+      context: ./src/dotnet
+      args: { PROJECT: Gateway }
+    image: paymentlab/gateway:local
+    environment:
+      ReverseProxy__Clusters__payments__Destinations__payments__Address: http://payments:8080/
+      ReverseProxy__Clusters__wallet__Destinations__wallet__Address: http://wallet:8080/
+      RateLimit__TokenLimit: ${GATEWAY_RATE_LIMIT}
+      RateLimit__TokensPerSecond: ${GATEWAY_RATE_LIMIT}
+    ports: ["8080:8080"]
+    depends_on: [payments, wallet]
+    healthcheck: &dotnet-health
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { cpus: "${GATEWAY_CPUS}", memory: "${GATEWAY_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ services
+  payments:
+    build:
+      context: ./src/dotnet
+      args: { PROJECT: Payments }
+    image: paymentlab/payments:local
+    environment:
+      ConnectionStrings__Payments: "Host=toxiproxy;Port=15432;Database=payments;Username=payments;Password=payments;Maximum Pool Size=${PAYMENTS_DB_POOL}"
+      Wallet__BaseUrl: http://toxiproxy:18082
+      RabbitMq__Host: toxiproxy
+      RabbitMq__Port: "35672"
+      RabbitMq__Prefetch: ${PAYMENTS_PREFETCH}
+    ports: ["8081:8080"]
+    depends_on:
+      payments-db: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      toxiproxy: { condition: service_started }
+    healthcheck: *dotnet-health
+    deploy:
+      resources:
+        limits: { cpus: "${PAYMENTS_CPUS}", memory: "${PAYMENTS_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  wallet:
+    build:
+      context: ./src/dotnet
+      args: { PROJECT: Wallet }
+    image: paymentlab/wallet:local
+    environment:
+      ConnectionStrings__Wallet: "Host=toxiproxy;Port=25432;Database=wallet;Username=wallet;Password=wallet;Maximum Pool Size=${WALLET_DB_POOL}"
+    ports: ["8082:8080"]
+    depends_on:
+      wallet-db: { condition: service_healthy }
+      toxiproxy: { condition: service_started }
+    healthcheck: *dotnet-health
+    deploy:
+      resources:
+        limits: { cpus: "${WALLET_CPUS}", memory: "${WALLET_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  connector:
+    build:
+      context: ./src/go/connector
+      dockerfile: ../Dockerfile
+      args: { MAIN: ./cmd/connector }
+    image: paymentlab/connector:local
+    environment:
+      AMQP_URL: amqp://lab:lab@toxiproxy:35673/
+      BANK_URL: http://toxiproxy:18090
+      PREFETCH: ${CONNECTOR_PREFETCH}
+      BANK_TIMEOUT_MS: "5000"
+      MAX_ATTEMPTS: "5"
+      RETRY_DELAY_MS: "5000"
+    ports: ["8085:8080"]
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      toxiproxy: { condition: service_started }
+    healthcheck: &go-health
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "${CONNECTOR_CPUS}", memory: "${CONNECTOR_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  fakebank:
+    build:
+      context: ./src/go/fakebank
+      dockerfile: ../Dockerfile
+      args: { MAIN: . }
+    image: paymentlab/fakebank:local
+    environment:
+      FAKEBANK_LATENCY_MS: ${FAKEBANK_LATENCY_MS}
+      FAKEBANK_JITTER_MS: ${FAKEBANK_JITTER_MS}
+      FAKEBANK_REJECT_RATE: ${FAKEBANK_REJECT_RATE}
+    ports: ["8090:8080"]
+    healthcheck: *go-health
+    deploy:
+      resources:
+        limits: { cpus: "${FAKEBANK_CPUS}", memory: "${FAKEBANK_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ infrastructure
+  payments-db:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - track_io_timing=on
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS}
+      - -c
+      - shared_buffers=${PAYMENTS_DB_SHARED_BUFFERS}
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - log_lock_waits=on
+      - -c
+      - deadlock_timeout=1s
+    ports: ["5432:5432"]
+    volumes:
+      - payments-db-data:/var/lib/postgresql
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    shm_size: 256m
+    deploy:
+      resources:
+        limits: { cpus: "${PAYMENTS_DB_CPUS}", memory: "${PAYMENTS_DB_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  wallet-db:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_DB: wallet
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - track_io_timing=on
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS}
+      - -c
+      - shared_buffers=${WALLET_DB_SHARED_BUFFERS}
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - log_lock_waits=on
+      - -c
+      - deadlock_timeout=1s
+    ports: ["5433:5432"]
+    volumes:
+      - wallet-db-data:/var/lib/postgresql
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    shm_size: 256m
+    deploy:
+      resources:
+        limits: { cpus: "${WALLET_DB_CPUS}", memory: "${WALLET_DB_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  rabbitmq:
+    image: ${RABBITMQ_IMAGE}
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+      - "15692:15692"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ./infra/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./infra/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits: { cpus: "${RABBITMQ_CPUS}", memory: "${RABBITMQ_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  toxiproxy:
+    image: ${TOXIPROXY_IMAGE}
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    ports: ["8474:8474"]
+    volumes:
+      - ./infra/toxiproxy/toxiproxy.json:/config/toxiproxy.json:ro
+    deploy:
+      resources:
+        limits: { cpus: "${TOXIPROXY_CPUS}", memory: "${TOXIPROXY_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+volumes:
+  payments-db-data:
+  wallet-db-data:
+  rabbitmq-data:
