@@ -4,6 +4,7 @@ using Payments.Api;
 using Payments.Clients;
 using Payments.Data;
 using Payments.Messaging;
+using Payments.Observability;
 using Payments.Saga;
 using Payments.Saga.Steps;
 using PaymentLab.Contracts;
@@ -16,7 +17,10 @@ builder.Services.ConfigureHttpJsonOptions(o =>
     o.SerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter()));
 
 builder.Services.AddDbContext<PaymentsDbContext>(o => o
-    .UseNpgsql(builder.Configuration.GetConnectionString("Payments"))
+    .UseNpgsql(builder.Configuration.GetConnectionString("Payments"), npgsql => npgsql
+        .ConfigureDataSource(ds => ds.ConfigureTracing(t => t
+            .ConfigureCommandSpanNameProvider(cmd => SqlSpanName.From(cmd.CommandText))
+            .ConfigureCommandEnrichmentCallback((activity, _) => activity.SetTag("peer.service", "payments-db")))))
     .UseSnakeCaseNamingConvention());
 builder.Services.AddSingleton(TimeProvider.System);
 
@@ -45,6 +49,7 @@ builder.Services.AddSingleton(RabbitMqOptions.From(builder.Configuration));
 builder.Services.AddSingleton<RabbitMqConnection>();
 builder.Services.AddHostedService<OutboxRelay>();
 builder.Services.AddHostedService<BankResultConsumer>();
+builder.Services.AddHostedService<PaymentsStatsCollector>();
 
 builder.Services.AddOpenApi();
 builder.Services.AddHealthChecks()

@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using Microsoft.Extensions.Options;
 using Payments.Data;
+using Payments.Observability;
 using Payments.Saga.Steps;
 using PaymentLab.Contracts;
 
@@ -85,7 +87,7 @@ public sealed class SagaStateMachine(PaymentSagaDefinition definition, IOptions<
             if (saga.State is SagaState.AwaitingBank or SagaState.VerifyingBankStatus && saga.CurrentStep is not null)
             {
                 var step = definition.Get(saga.CurrentStep);
-                await ApplyForward(ctx, step, await Safe(ct, () => step.OnMessageAsync(ctx, message, ct)));
+                await ApplyForward(ctx, step, await Safe(ct, step, "message", () => step.OnMessageAsync(ctx, message, ct)));
             }
             else
             {
@@ -108,14 +110,14 @@ public sealed class SagaStateMachine(PaymentSagaDefinition definition, IOptions<
 
             if (saga.State == SagaState.Compensating)
             {
-                ApplyCompensation(ctx, step, await Safe(ct, () => step.CompensateAsync(ctx, ct)));
+                ApplyCompensation(ctx, step, await Safe(ct, step, "compensate", () => step.CompensateAsync(ctx, ct)));
                 continue;
             }
 
             var waiting = saga.WaitingUntil is not null;
             var outcome = waiting
-                ? await Safe(ct, () => step.OnTimeoutAsync(ctx, ct))
-                : await Safe(ct, () => step.ExecuteAsync(ctx, ct));
+                ? await Safe(ct, step, "timeout", () => step.OnTimeoutAsync(ctx, ct))
+                : await Safe(ct, step, "execute", () => step.ExecuteAsync(ctx, ct));
             await ApplyForward(ctx, step, outcome);
         }
     }
@@ -141,6 +143,7 @@ public sealed class SagaStateMachine(PaymentSagaDefinition definition, IOptions<
             case StepOutcome.Retry r:
                 saga.Attempt++;
                 saga.LastError = r.Error;
+                PaymentsTelemetry.StepRetries.Add(1, new("step", step.Name), new("phase", "forward"));
                 if (saga.Attempt < step.MaxAttempts)
                 {
                     saga.WaitingUntil = null;
@@ -255,6 +258,7 @@ public sealed class SagaStateMachine(PaymentSagaDefinition definition, IOptions<
             case StepOutcome.Retry r:
                 saga.Attempt++;
                 saga.LastError = r.Error;
+                PaymentsTelemetry.StepRetries.Add(1, new("step", step.Name), new("phase", "compensate"));
                 if (saga.Attempt < step.MaxAttempts)
                 {
                     saga.NextAttemptAt = ctx.Now + Backoff(saga.Attempt);
@@ -324,6 +328,12 @@ public sealed class SagaStateMachine(PaymentSagaDefinition definition, IOptions<
         ctx.Payment.UpdatedAt = ctx.Now;
         if (PaymentSagaDefinition.IsFinal(to)) ctx.Payment.CompletedAt = ctx.Now;
         ctx.RecordTransition(from, to, detail);
+        ctx.Logger.LogInformation("Payment {PaymentId} saga {FromState} -> {ToState} {Detail}", saga.PaymentId, from, to, detail ?? "");
+        PaymentsTelemetry.Transitions.Add(1, new("from", from.ToString()), new("to", to.ToString()));
+        Activity.Current?.AddEvent(new ActivityEvent("saga.transition", tags: new ActivityTagsCollection
+        {
+            ["from"] = from.ToString(), ["to"] = to.ToString(), ["detail"] = detail,
+        }));
     }
 
     private TimeSpan Backoff(int attempt)
@@ -332,10 +342,34 @@ public sealed class SagaStateMachine(PaymentSagaDefinition definition, IOptions<
         return TimeSpan.FromSeconds(seconds * (0.8 + Random.Shared.NextDouble() * 0.4));
     }
 
-    private static async Task<StepOutcome> Safe(CancellationToken ct, Func<Task<StepOutcome>> action)
+    /// <summary>Runs a step callback in its own span; exceptions become a Retry outcome.</summary>
+    private static async Task<StepOutcome> Safe(CancellationToken ct, ISagaStep step, string phase, Func<Task<StepOutcome>> action)
     {
-        try { return await action(); }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception ex) { return new StepOutcome.Retry($"{ex.GetType().Name}: {ex.Message}"); }
+        using var activity = PaymentsTelemetry.Source.StartActivity($"saga.step {step.Name} {phase}");
+        activity?.SetTag("saga.step", step.Name);
+        activity?.SetTag("saga.step.phase", phase);
+        var started = Stopwatch.GetTimestamp();
+        StepOutcome outcome;
+        try
+        {
+            outcome = await action();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            activity?.AddException(ex);
+            outcome = new StepOutcome.Retry($"{ex.GetType().Name}: {ex.Message}");
+        }
+
+        var name = outcome.GetType().Name;
+        activity?.SetTag("saga.step.outcome", name);
+        if (outcome is StepOutcome.Retry or StepOutcome.Escalate)
+            activity?.SetStatus(ActivityStatusCode.Error, outcome.ToString());
+        PaymentsTelemetry.StepDuration.Record(Stopwatch.GetElapsedTime(started).TotalSeconds,
+            new("step", step.Name), new("phase", phase), new("outcome", name));
+        return outcome;
     }
 }

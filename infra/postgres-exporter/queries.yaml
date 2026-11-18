@@ -1,0 +1,52 @@
+# Extra queries for postgres_exporter (in addition to the built-in collectors enabled in docker-compose).
+pg_sessions:
+  query: |
+    SELECT coalesce(nullif(application_name, ''), 'unknown') AS application_name,
+           coalesce(state, 'unknown') AS state,
+           coalesce(wait_event_type, 'none') AS wait_event_type,
+           count(*) AS count
+    FROM pg_stat_activity
+    WHERE datname = current_database() AND pid <> pg_backend_pid()
+    GROUP BY 1, 2, 3
+  metrics:
+    - application_name: { usage: LABEL, description: "Client application name" }
+    - state: { usage: LABEL, description: "Session state" }
+    - wait_event_type: { usage: LABEL, description: "What the session waits for" }
+    - count: { usage: GAUGE, description: "Number of sessions" }
+
+pg_oldest_transaction:
+  query: |
+    SELECT s.state,
+           coalesce(max(extract(epoch FROM now() - a.xact_start)), 0) AS age_seconds
+    FROM (VALUES ('active'), ('idle in transaction'), ('idle in transaction (aborted)')) AS s(state)
+    LEFT JOIN pg_stat_activity a
+      ON a.state = s.state AND a.datname = current_database()
+     AND a.xact_start IS NOT NULL AND a.pid <> pg_backend_pid()
+    GROUP BY s.state
+  metrics:
+    - state: { usage: LABEL, description: "Session state" }
+    - age_seconds: { usage: GAUGE, description: "Age of the oldest open transaction per session state" }
+
+pg_blocked:
+  query: |
+    SELECT count(*) AS sessions
+    FROM pg_stat_activity
+    WHERE datname = current_database() AND cardinality(pg_blocking_pids(pid)) > 0
+  metrics:
+    - sessions: { usage: GAUGE, description: "Sessions waiting for a lock held by another session" }
+
+pg_table:
+  query: |
+    SELECT c.relname AS relname,
+           pg_total_relation_size(c.oid) AS total_bytes,
+           coalesce(s.n_live_tup, 0) AS live_rows,
+           coalesce(s.n_dead_tup, 0) AS dead_rows
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+    WHERE n.nspname = 'public' AND c.relkind = 'r'
+  metrics:
+    - relname: { usage: LABEL, description: "Table" }
+    - total_bytes: { usage: GAUGE, description: "Table size including indexes and TOAST" }
+    - live_rows: { usage: GAUGE, description: "Estimated live rows" }
+    - dead_rows: { usage: GAUGE, description: "Estimated dead rows" }

@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Wallet.Data;
+using Wallet.Observability;
 using Wallet.Services;
 
 namespace Wallet.Api;
@@ -14,6 +15,10 @@ public sealed record ReservationResponse(string Status, string? Reason = null);
 
 public static class Endpoints
 {
+    private static void Log(HttpContext http, string op, Guid paymentId, object result) =>
+        http.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("Wallet.Reservations")
+            .LogInformation("{Operation} for payment {PaymentId}: {Result}", op, paymentId, result);
+
     public static void MapWalletEndpoints(this WebApplication app)
     {
         var accounts = app.MapGroup("/accounts").WithTags("Accounts");
@@ -23,6 +28,7 @@ public static class Endpoints
             if (string.IsNullOrWhiteSpace(req.OwnerName)) return Results.ValidationProblem(new Dictionary<string, string[]> { ["ownerName"] = ["required"] });
             if (req.InitialBalanceMinor < 0) return Results.ValidationProblem(new Dictionary<string, string[]> { ["initialBalanceMinor"] = ["must be >= 0"] });
             var a = await svc.CreateAccountAsync(req.OwnerName, (req.Currency ?? "EUR").ToUpperInvariant(), req.InitialBalanceMinor, ct);
+            WalletTelemetry.AccountsCreated.Add(1);
             return Results.Created($"/accounts/{a.Id}", ToResponse(a));
         });
 
@@ -47,10 +53,13 @@ public static class Endpoints
         // Internal API used by the Payments saga. Not routed through the gateway.
         var reservations = app.MapGroup("/reservations").WithTags("Reservations (internal)");
 
-        reservations.MapPost("/", async (ReserveRequest req, WalletService svc, CancellationToken ct) =>
+        reservations.MapPost("/", async (ReserveRequest req, WalletService svc, HttpContext http, CancellationToken ct) =>
         {
             if (req.AmountMinor <= 0) return Results.ValidationProblem(new Dictionary<string, string[]> { ["amountMinor"] = ["must be > 0"] });
             var result = await svc.ReserveAsync(req.PaymentId, req.AccountId, req.AmountMinor, req.Currency, ct);
+            WalletTelemetry.Op("reserve", result);
+            Log(http, "reserve", req.PaymentId, result);
+            System.Diagnostics.Activity.Current?.SetTag("payment.id", req.PaymentId);
             return result switch
             {
                 ReserveResult.Reserved => Results.Ok(new ReservationResponse("Reserved")),
@@ -60,9 +69,12 @@ public static class Endpoints
             };
         });
 
-        reservations.MapPost("/{paymentId:guid}/commit", async (Guid paymentId, CommitRequest? req, WalletService svc, CancellationToken ct) =>
+        reservations.MapPost("/{paymentId:guid}/commit", async (Guid paymentId, CommitRequest? req, WalletService svc, HttpContext http, CancellationToken ct) =>
         {
             var result = await svc.CommitAsync(paymentId, req?.CreditAccountId, ct);
+            WalletTelemetry.Op("commit", result);
+            Log(http, "commit", paymentId, result);
+            System.Diagnostics.Activity.Current?.SetTag("payment.id", paymentId);
             return result switch
             {
                 CommitResult.Committed => Results.Ok(new ReservationResponse("Committed")),
@@ -72,9 +84,12 @@ public static class Endpoints
             };
         });
 
-        reservations.MapPost("/{paymentId:guid}/release", async (Guid paymentId, WalletService svc, CancellationToken ct) =>
+        reservations.MapPost("/{paymentId:guid}/release", async (Guid paymentId, WalletService svc, HttpContext http, CancellationToken ct) =>
         {
             var result = await svc.ReleaseAsync(paymentId, ct);
+            WalletTelemetry.Op("release", result);
+            Log(http, "release", paymentId, result);
+            System.Diagnostics.Activity.Current?.SetTag("payment.id", paymentId);
             return result == ReleaseResult.Released
                 ? Results.Ok(new ReservationResponse("Released"))
                 : Results.Conflict(new ReservationResponse("Committed"));

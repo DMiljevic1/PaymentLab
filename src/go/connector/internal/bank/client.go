@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"paymentlab/connector/internal/messages"
 )
 
@@ -32,11 +34,11 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 		baseURL: baseURL,
 		http: &http.Client{
 			Timeout: timeout,
-			Transport: &http.Transport{
+			Transport: otelhttp.NewTransport(&http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
 				IdleConnTimeout:     90 * time.Second,
-			},
+			}),
 		},
 	}
 }

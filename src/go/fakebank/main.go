@@ -13,6 +13,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
@@ -65,9 +69,30 @@ type bank struct {
 	log       *slog.Logger
 }
 
+var (
+	meter             = otel.Meter("paymentlab/fakebank")
+	transfersCount, _ = meter.Int64Counter("fakebank.transfers",
+		metric.WithUnit("{transfer}"), metric.WithDescription("Transfer requests by result"))
+)
+
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).With("service", "fakebank")
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log, shutdownTelemetry, err := setupTelemetry(ctx, "fakebank")
+	if err != nil {
+		slog.Error("telemetry setup failed", "error", err)
+		os.Exit(1)
+	}
 	b := &bank{transfers: make(map[string]*Transfer), log: log}
+	_, _ = meter.Int64ObservableGauge("fakebank.transfers.stored",
+		metric.WithUnit("{transfer}"), metric.WithDescription("Transfers kept in memory"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			b.mu.RLock()
+			defer b.mu.RUnlock()
+			o.Observe(int64(len(b.transfers)))
+			return nil
+		}))
 	cfg := Config{
 		LatencyMs:        envInt("FAKEBANK_LATENCY_MS", 50),
 		JitterMs:         envInt("FAKEBANK_JITTER_MS", 50),
@@ -87,10 +112,16 @@ func main() {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	addr := ":" + envStr("PORT", "8080")
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	handler := otelhttp.NewHandler(mux, "fakebank",
+		otelhttp.WithFilter(func(r *http.Request) bool { return r.URL.Path != "/healthz" }),
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			if strings.HasPrefix(r.URL.Path, "/v1/transfers/") {
+				return r.Method + " /v1/transfers/{key}"
+			}
+			return r.Method + " " + r.URL.Path
+		}))
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	go b.sweep(ctx)
 
 	go func() {
@@ -104,6 +135,7 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+	_ = shutdownTelemetry(shutdownCtx)
 }
 
 func (b *bank) createTransfer(w http.ResponseWriter, r *http.Request) {
@@ -122,6 +154,7 @@ func (b *bank) createTransfer(w http.ResponseWriter, r *http.Request) {
 	existing, ok := b.transfers[key]
 	b.mu.RUnlock()
 	if ok {
+		transfersCount.Add(r.Context(), 1, metric.WithAttributes(attribute.String("result", "replay")))
 		writeJSON(w, http.StatusOK, existing)
 		return
 	}
@@ -138,7 +171,8 @@ func (b *bank) createTransfer(w http.ResponseWriter, r *http.Request) {
 
 	if rand.Float64() < cfg.ErrorRate {
 		sleep(r.Context(), delay)
-		b.log.Warn("simulated bank error", "key", key)
+		transfersCount.Add(r.Context(), 1, metric.WithAttributes(attribute.String("result", "error")))
+		b.log.WarnContext(r.Context(), "simulated bank error", "key", key)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable"})
 		return
 	}
@@ -172,7 +206,8 @@ func (b *bank) createTransfer(w http.ResponseWriter, r *http.Request) {
 	b.mu.Unlock()
 
 	sleep(r.Context(), delay)
-	b.log.Info("transfer processed", "key", key, "status", t.Status, "reason", t.ReasonCode, "slow", slow,
+	transfersCount.Add(r.Context(), 1, metric.WithAttributes(attribute.String("result", strings.ToLower(t.Status))))
+	b.log.InfoContext(r.Context(), "transfer processed", "key", key, "status", t.Status, "reason", t.ReasonCode, "slow", slow,
 		"amountMinor", t.AmountMinor, "latencyMs", delay.Milliseconds())
 	writeJSON(w, http.StatusCreated, t)
 }

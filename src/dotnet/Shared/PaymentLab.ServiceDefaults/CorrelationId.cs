@@ -24,6 +24,7 @@ public static class CorrelationId
             }
             ctx.Items[ItemKey] = id;
             ctx.Response.Headers[HeaderName] = id;
+            System.Diagnostics.Activity.Current?.SetTag("correlation.id", id);
 
             var logger = ctx.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("CorrelationId");
             using (logger.BeginScope(new Dictionary<string, object> { ["correlation_id"] = id }))

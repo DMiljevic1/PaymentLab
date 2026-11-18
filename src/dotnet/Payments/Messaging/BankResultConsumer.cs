@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Payments.Data;
+using Payments.Observability;
 using Payments.Saga;
 using PaymentLab.Contracts;
 using PaymentLab.ServiceDefaults;
@@ -43,6 +45,14 @@ public sealed class BankResultConsumer(
     private async Task OnReceivedAsync(object sender, BasicDeliverEventArgs ea)
     {
         var channel = ((AsyncEventingBasicConsumer)sender).Channel;
+        var headerTraceParent = Header(ea, MessageHeaders.TraceParent);
+        using var activity = PaymentsTelemetry.Source.StartActivity($"{Topology.PaymentsResultsQueue} process", ActivityKind.Consumer,
+            Telemetry.ParentFrom(headerTraceParent));
+        activity?.SetTag("messaging.system", "rabbitmq");
+        activity?.SetTag("messaging.operation.type", "process");
+        activity?.SetTag("messaging.destination.name", Topology.PaymentsResultsQueue);
+        activity?.SetTag("messaging.message.id", ea.BasicProperties.MessageId);
+        activity?.SetTag("messaging.rabbitmq.redelivered", ea.Redelivered);
         BankTransferResult? result;
         string payload;
         try
@@ -54,6 +64,8 @@ public sealed class BankResultConsumer(
         }
         catch (Exception ex)
         {
+            activity?.SetStatus(ActivityStatusCode.Error, "malformed");
+            PaymentsTelemetry.BankResultsReceived.Add(1, new("outcome", "malformed"), new("result", "dead_lettered"));
             logger.LogError("Malformed bank result (delivery {Tag}), dead-lettering: {Error}", ea.DeliveryTag, ex.Message);
             await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: false);
             return;
@@ -61,8 +73,9 @@ public sealed class BankResultConsumer(
 
         try
         {
-            var traceParent = ea.BasicProperties.Headers?.TryGetValue(MessageHeaders.TraceParent, out var tp) == true && tp is byte[] b
-                ? Encoding.UTF8.GetString(b) : null;
+            activity?.SetTag("payment.id", result.PaymentId);
+            activity?.SetTag("bank.outcome", result.Outcome);
+            var traceParent = activity?.Id ?? headerTraceParent;
 
             await using var scope = scopes.CreateAsyncScope();
             var db = scope.ServiceProvider.GetRequiredService<PaymentsDbContext>();
@@ -71,6 +84,7 @@ public sealed class BankResultConsumer(
                 VALUES ({result.MessageId}, {result.PaymentId}, {MessageTypes.BankTransferResult}, {payload}::jsonb, {traceParent}, {clock.GetUtcNow()})
                 ON CONFLICT (message_id) DO NOTHING
                 """);
+            PaymentsTelemetry.BankResultsReceived.Add(1, new("outcome", result.Outcome), new("result", inserted == 1 ? "stored" : "duplicate"));
 
             await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
             if (inserted == 1)
@@ -80,11 +94,18 @@ public sealed class BankResultConsumer(
         }
         catch (Exception ex)
         {
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            PaymentsTelemetry.BankResultsReceived.Add(1, new("outcome", result.Outcome), new("result", "requeued"));
             logger.LogError("Storing bank result for {PaymentId} failed, requeueing: {Error}", result.PaymentId, ex.Message);
             await Task.Delay(TimeSpan.FromSeconds(1));
             await channel.BasicNackAsync(ea.DeliveryTag, multiple: false, requeue: true);
         }
     }
+
+    private static string? Header(BasicDeliverEventArgs ea, string key) =>
+        ea.BasicProperties.Headers?.TryGetValue(key, out var v) == true
+            ? v switch { byte[] b => Encoding.UTF8.GetString(b), string s => s, _ => null }
+            : null;
 
     public override void Dispose()
     {

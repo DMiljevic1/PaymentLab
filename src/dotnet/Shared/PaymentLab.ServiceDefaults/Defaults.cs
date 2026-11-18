@@ -19,6 +19,8 @@ public static class Defaults
         builder.Logging.Configure(o => o.ActivityTrackingOptions =
             ActivityTrackingOptions.TraceId | ActivityTrackingOptions.SpanId);
 
+        builder.AddTelemetry(serviceName);
+
         builder.Services.AddHealthChecks();
         builder.Services.AddSingleton(new ServiceInfo(serviceName));
         return builder;

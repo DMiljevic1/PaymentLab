@@ -1,0 +1,51 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  # Application metrics (all services push OTLP to the collector, Prometheus scrapes it).
+  # honor_labels keeps job/instance as set by the collector (job = service name).
+  - job_name: otel-collector
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  - job_name: otel-collector-internal
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  # RabbitMQ built-in Prometheus plugin (per-object metrics enabled in rabbitmq.conf)
+  - job_name: rabbitmq
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["payments-db-exporter:9187"]
+        labels: { db: payments }
+      - targets: ["wallet-db-exporter:9187"]
+        labels: { db: wallet }
+
+  - job_name: cadvisor
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metric_relabel_configs:
+      # keep only containers of this compose project, and give them a short "service" label
+      - source_labels: [container_label_com_docker_compose_project]
+        regex: paymentlab
+        action: keep
+      - source_labels: [container_label_com_docker_compose_service]
+        target_label: service
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,9 +1,12 @@
+using System.Diagnostics;
 using System.Text.Json;
 using System.Threading.Channels;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Payments.Data;
+using Payments.Observability;
 using PaymentLab.Contracts;
+using PaymentLab.ServiceDefaults;
 
 namespace Payments.Saga;
 
@@ -41,7 +44,8 @@ public sealed class SagaProcessor(
         await using var scope = scopes.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<PaymentsDbContext>();
         double lease = _opt.LeaseSeconds;
-        return await db.Database.SqlQuery<Guid>($"""
+        var started = Stopwatch.GetTimestamp();
+        var claimed = await db.Database.SqlQuery<Guid>($"""
             UPDATE payment_sagas SET locked_by = {Owner}, locked_until = now() + make_interval(secs => {lease})
             WHERE payment_id IN (
                 SELECT s.payment_id FROM payment_sagas s
@@ -53,6 +57,9 @@ public sealed class SagaProcessor(
                 FOR UPDATE SKIP LOCKED)
             RETURNING payment_id AS "Value"
             """).ToListAsync(ct);
+        PaymentsTelemetry.ClaimDuration.Record(Stopwatch.GetElapsedTime(started).TotalSeconds);
+        PaymentsTelemetry.ClaimBatchSize.Record(claimed.Count);
+        return claimed;
     }
 
     /// <summary>Tries to claim one specific saga (after a nudge). Returns false if someone else holds it.</summary>
@@ -68,9 +75,12 @@ public sealed class SagaProcessor(
         return rows == 1;
     }
 
-    public async Task ProcessClaimedAsync(Guid paymentId, CancellationToken ct)
+    public async Task ProcessClaimedAsync(Guid paymentId, CancellationToken ct, string trigger = "poll")
     {
         var sentMessages = false;
+        var result = "ok";
+        Activity? activity = null;
+        using var logScope = logger.BeginScope(new Dictionary<string, object> { ["payment_id"] = paymentId });
         try
         {
             await using var scope = scopes.CreateAsyncScope();
@@ -79,13 +89,32 @@ public sealed class SagaProcessor(
             var machine = sp.GetRequiredService<SagaStateMachine>();
 
             var saga = await db.Sagas.SingleAsync(s => s.PaymentId == paymentId, ct);
-            if (saga.LockedBy != Owner) return; // lease lost
+            if (saga.LockedBy != Owner)
+            {
+                result = "lease_lost";
+                return;
+            }
             var payment = await db.Payments.SingleAsync(p => p.Id == paymentId, ct);
             var inbox = await db.Inbox
                 .Where(i => i.PaymentId == paymentId && i.ProcessedAt == null)
                 .OrderBy(i => i.ReceivedAt)
                 .ToListAsync(ct);
 
+            // Every run of the saga continues the trace of the original POST /payments request, so one
+            // payment is one trace. Incoming bank results are attached as links to the message's own trace context.
+            var links = inbox.Where(i => i.TraceParent is not null)
+                .Select(i => new ActivityLink(Telemetry.ParentFrom(i.TraceParent)))
+                .Where(l => l.Context != default)
+                .ToList();
+            activity = PaymentsTelemetry.Source.StartActivity(ActivityKind.Internal, Telemetry.ParentFrom(saga.TraceParent),
+                links: links, name: $"saga {saga.State}");
+            activity?.SetTag("payment.id", paymentId);
+            activity?.SetTag("payment.type", payment.Type.ToString());
+            activity?.SetTag("saga.trigger", trigger);
+            activity?.SetTag("saga.state.before", saga.State.ToString());
+            activity?.SetTag("saga.inbox_messages", inbox.Count);
+
+            var initialState = saga.State;
             var ctx = new SagaContext(payment, saga, db, clock, logger);
             var messages = inbox
                 .Where(i => i.Type == MessageTypes.BankTransferResult)
@@ -99,18 +128,42 @@ public sealed class SagaProcessor(
             saga.LockedUntil = null;
             await db.SaveChangesAsync(ct);
             sentMessages = ctx.HasOutgoingMessages;
+
+            activity?.SetTag("saga.state.after", saga.State.ToString());
+            RecordOutcome(payment, initialState, saga.State, ctx.Now);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            result = "cancelled";
             throw;
         }
         catch (Exception ex)
         {
+            result = "error";
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            activity?.AddException(ex);
             logger.LogError(ex, "Processing saga {PaymentId} failed", paymentId);
             await ReleaseLeaseAsync(paymentId);
         }
+        finally
+        {
+            activity?.Dispose();
+            PaymentsTelemetry.SagaRuns.Add(1, new("trigger", trigger), new("result", result));
+        }
 
         if (sentMessages) signals.OutboxReady();
+    }
+
+    private static void RecordOutcome(Payment payment, SagaState before, SagaState after, DateTimeOffset now)
+    {
+        if (before == after) return;
+        if (!PaymentSagaDefinition.IsFinal(after) && after != SagaState.RequiresAttention) return;
+
+        var type = new KeyValuePair<string, object?>("type", payment.Type.ToString());
+        var state = new KeyValuePair<string, object?>("state", after.ToString());
+        PaymentsTelemetry.PaymentsFinished.Add(1, type, state);
+        if (PaymentSagaDefinition.IsFinal(after))
+            PaymentsTelemetry.PaymentDuration.Record((now - payment.CreatedAt).TotalSeconds, type, state);
     }
 
     private async Task ReleaseLeaseAsync(Guid paymentId)

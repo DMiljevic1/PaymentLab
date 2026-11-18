@@ -17,14 +17,20 @@ import (
 	"paymentlab/connector/internal/config"
 	"paymentlab/connector/internal/handler"
 	"paymentlab/connector/internal/messages"
+	"paymentlab/connector/internal/telemetry"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).With("service", "connector")
 	cfg := config.Load()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	log, shutdownTelemetry, err := telemetry.Setup(ctx, "connector")
+	if err != nil {
+		slog.Error("telemetry setup failed", "error", err)
+		os.Exit(1)
+	}
 
 	var connected atomic.Bool
 	health := &http.Server{Addr: cfg.HealthAddr, ReadHeaderTimeout: 5 * time.Second, Handler: healthMux(&connected)}
@@ -58,6 +64,7 @@ func main() {
 	defer cancel()
 	_ = health.Shutdown(shutdownCtx)
 	log.Info("connector stopped")
+	_ = shutdownTelemetry(shutdownCtx)
 }
 
 func healthMux(connected *atomic.Bool) *http.ServeMux {

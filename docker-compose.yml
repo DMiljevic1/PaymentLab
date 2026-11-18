@@ -1,4 +1,4 @@
-﻿# PaymentLab â€“ all services. Start with ./lab.ps1 up
+# PaymentLab - all services. Start with ./lab.ps1 up
 # Resource limits and tuning knobs come from .env (see there).
 #
 # Services talk to their dependencies THROUGH toxiproxy (ports 15432, 25432, 35672/35673, 18082, 18090),
@@ -10,6 +10,13 @@ x-logging: &logging
     max-size: "20m"
     max-file: "3"
 
+# OpenTelemetry SDK settings shared by all application services (traces, metrics, logs -> collector)
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_METRIC_EXPORT_INTERVAL: "10000"
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=lab
+
 services:
   # ------------------------------------------------------------------ edge
   gateway:
@@ -18,6 +25,7 @@ services:
       args: { PROJECT: Gateway }
     image: paymentlab/gateway:local
     environment:
+      <<: *otel-env
       ReverseProxy__Clusters__payments__Destinations__payments__Address: http://payments:8080/
       ReverseProxy__Clusters__wallet__Destinations__wallet__Address: http://wallet:8080/
       RateLimit__TokenLimit: ${GATEWAY_RATE_LIMIT}
@@ -43,7 +51,8 @@ services:
       args: { PROJECT: Payments }
     image: paymentlab/payments:local
     environment:
-      ConnectionStrings__Payments: "Host=toxiproxy;Port=15432;Database=payments;Username=payments;Password=payments;Maximum Pool Size=${PAYMENTS_DB_POOL}"
+      <<: *otel-env
+      ConnectionStrings__Payments: "Host=toxiproxy;Port=15432;Database=payments;Username=payments;Password=payments;Maximum Pool Size=${PAYMENTS_DB_POOL};Application Name=payments"
       Wallet__BaseUrl: http://toxiproxy:18082
       RabbitMq__Host: toxiproxy
       RabbitMq__Port: "35672"
@@ -66,7 +75,8 @@ services:
       args: { PROJECT: Wallet }
     image: paymentlab/wallet:local
     environment:
-      ConnectionStrings__Wallet: "Host=toxiproxy;Port=25432;Database=wallet;Username=wallet;Password=wallet;Maximum Pool Size=${WALLET_DB_POOL}"
+      <<: *otel-env
+      ConnectionStrings__Wallet: "Host=toxiproxy;Port=25432;Database=wallet;Username=wallet;Password=wallet;Maximum Pool Size=${WALLET_DB_POOL};Application Name=wallet"
     ports: ["8082:8080"]
     depends_on:
       wallet-db: { condition: service_healthy }
@@ -85,6 +95,7 @@ services:
       args: { MAIN: ./cmd/connector }
     image: paymentlab/connector:local
     environment:
+      <<: *otel-env
       AMQP_URL: amqp://lab:lab@toxiproxy:35673/
       BANK_URL: http://toxiproxy:18090
       PREFETCH: ${CONNECTOR_PREFETCH}
@@ -113,6 +124,7 @@ services:
       args: { MAIN: . }
     image: paymentlab/fakebank:local
     environment:
+      <<: *otel-env
       FAKEBANK_LATENCY_MS: ${FAKEBANK_LATENCY_MS}
       FAKEBANK_JITTER_MS: ${FAKEBANK_JITTER_MS}
       FAKEBANK_REJECT_RATE: ${FAKEBANK_REJECT_RATE}
@@ -208,6 +220,9 @@ services:
   rabbitmq:
     image: ${RABBITMQ_IMAGE}
     hostname: rabbitmq
+    environment:
+      # RabbitMQ does not see the container memory limit; tell it, so its memory alarm (60%) fires before an OOM kill.
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: '-rabbit total_memory_available_override_value "${RABBITMQ_MEM}"'
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -240,7 +255,164 @@ services:
     logging: *logging
     restart: unless-stopped
 
+  # ------------------------------------------------------------------ observability
+  otel-collector:
+    image: ${OTEL_COLLECTOR_IMAGE}
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./infra/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    deploy:
+      resources:
+        limits: { cpus: "${OTEL_COLLECTOR_CPUS}", memory: "${OTEL_COLLECTOR_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  prometheus:
+    image: ${PROMETHEUS_IMAGE}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION}
+      - --web.enable-remote-write-receiver   # Tempo metrics generator + k6
+      - --enable-feature=exemplar-storage
+      - --web.enable-lifecycle
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["9090:9090"]
+    deploy:
+      resources:
+        limits: { cpus: "${PROMETHEUS_CPUS}", memory: "${PROMETHEUS_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  loki:
+    image: ${LOKI_IMAGE}
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./infra/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    ports: ["3100:3100"]
+    deploy:
+      resources:
+        limits: { cpus: "${LOKI_CPUS}", memory: "${LOKI_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  tempo:
+    image: ${TEMPO_IMAGE}
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    user: "0"   # the named volume is created root-owned
+    volumes:
+      - ./infra/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports: ["3200:3200"]
+    deploy:
+      resources:
+        limits: { cpus: "${TEMPO_CPUS}", memory: "${TEMPO_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  grafana:
+    image: ${GRAFANA_IMAGE}
+    environment:
+      # Dashboards open without login (anonymous = Viewer). Viewers may also use Explore.
+      # Sign in as admin / admin to edit dashboards.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_USERS_VIEWERS_CAN_EDIT: "true"
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/overview.json
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]
+    depends_on: [prometheus, loki, tempo]
+    deploy:
+      resources:
+        limits: { cpus: "${GRAFANA_CPUS}", memory: "${GRAFANA_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  # Exporters connect to the databases directly (not through toxiproxy), so DB metrics stay visible
+  # even when the network path between a service and its database is degraded.
+  payments-db-exporter:
+    image: ${PG_EXPORTER_IMAGE}
+    environment:
+      DATA_SOURCE_URI: payments-db:5432/payments?sslmode=disable
+      DATA_SOURCE_USER: payments
+      DATA_SOURCE_PASS: payments
+    command: &pg-exporter-args
+      - --collector.stat_statements
+      - --collector.stat_statements.include_query
+      - --collector.stat_statements.query_length=200
+      - --collector.long_running_transactions
+      - --collector.stat_activity_autovacuum
+      - --collector.statio_user_tables
+      - --extend.query-path=/etc/pg-exporter/queries.yaml
+    volumes: &pg-exporter-volumes
+      - ./infra/postgres-exporter/queries.yaml:/etc/pg-exporter/queries.yaml:ro
+    depends_on:
+      payments-db: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "${PG_EXPORTER_CPUS}", memory: "${PG_EXPORTER_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  wallet-db-exporter:
+    image: ${PG_EXPORTER_IMAGE}
+    environment:
+      DATA_SOURCE_URI: wallet-db:5432/wallet?sslmode=disable
+      DATA_SOURCE_USER: wallet
+      DATA_SOURCE_PASS: wallet
+    command: *pg-exporter-args
+    volumes: *pg-exporter-volumes
+    depends_on:
+      wallet-db: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "${PG_EXPORTER_CPUS}", memory: "${PG_EXPORTER_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
+  # Container CPU / memory / throttling. On Docker Desktop it reads the cgroups of the Linux VM.
+  cadvisor:
+    image: ${CADVISOR_IMAGE}
+    privileged: true
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=10s
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.project,com.docker.compose.service
+      - --disable_metrics=advtcp,cpu_topology,cpuset,hugetlb,memory_numa,percpu,referenced_memory,resctrl,sched,tcp,udp,disk,diskIO,process
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    devices:
+      - /dev/kmsg
+    ports: ["8088:8080"]
+    deploy:
+      resources:
+        limits: { cpus: "${CADVISOR_CPUS}", memory: "${CADVISOR_MEM}" }
+    logging: *logging
+    restart: unless-stopped
+
 volumes:
   payments-db-data:
   wallet-db-data:
   rabbitmq-data:
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  grafana-data:

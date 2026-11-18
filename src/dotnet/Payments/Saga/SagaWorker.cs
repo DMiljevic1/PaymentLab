@@ -55,7 +55,7 @@ public sealed class SagaWorker(SagaProcessor processor, SagaSignals signals, IOp
                 try
                 {
                     if (await processor.TryClaimAsync(id, token))
-                        await processor.ProcessClaimedAsync(id, token);
+                        await processor.ProcessClaimedAsync(id, token, "nudge");
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { }
                 catch (Exception ex)

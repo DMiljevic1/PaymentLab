@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"paymentlab/connector/internal/bank"
 	"paymentlab/connector/internal/broker"
@@ -30,22 +33,27 @@ const publishTimeout = 10 * time.Second
 func (h *Handler) HandleTransfer(ctx context.Context, d amqp.Delivery, pub *broker.Publisher) {
 	var cmd messages.SubmitBankTransfer
 	if err := json.Unmarshal(d.Body, &cmd); err != nil || cmd.PaymentID == "" {
-		h.Log.Error("malformed transfer command, dead-lettering", "messageId", d.MessageId, "error", err)
+		h.Log.ErrorContext(ctx, "malformed transfer command, dead-lettering", "messageId", d.MessageId, "error", err)
 		_ = d.Nack(false, false)
+		settled(ctx, messages.TransfersQueue, "malformed", false)
 		return
 	}
 	attempt := attemptOf(d)
 	log := h.Log.With("paymentId", cmd.PaymentID, "attempt", attempt)
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("connector.attempt", attempt))
 
+	started := time.Now()
 	res, err := h.Bank.Submit(ctx, cmd)
 	if err != nil {
+		bankCall(ctx, "submit", "error", started)
 		if errors.Is(err, bank.ErrTransient) && attempt < h.MaxAttempts {
-			log.Warn("bank call failed, scheduling retry", "error", err)
+			log.WarnContext(ctx, "bank call failed, scheduling retry", "error", err)
 			h.retry(ctx, d, attempt, pub, log)
 			return
 		}
-		log.Error("bank call failed, giving up (dead-letter)", "error", err)
+		log.ErrorContext(ctx, "bank call failed, giving up (dead-letter)", "error", err)
 		_ = d.Nack(false, false)
+		settled(ctx, messages.TransfersQueue, "dead_lettered", false)
 		return
 	}
 
@@ -53,7 +61,8 @@ func (h *Handler) HandleTransfer(ctx context.Context, d amqp.Delivery, pub *brok
 	if res.Accepted {
 		outcome = messages.OutcomeAccepted
 	}
-	h.publishResult(ctx, d, pub, log, messages.BankTransferResult{
+	bankCall(ctx, "submit", strings.ToLower(outcome), started)
+	h.publishResult(ctx, messages.TransfersQueue, d, pub, log, messages.BankTransferResult{
 		MessageID:     uuid.NewString(),
 		PaymentID:     cmd.PaymentID,
 		Outcome:       outcome,
@@ -67,17 +76,19 @@ func (h *Handler) HandleTransfer(ctx context.Context, d amqp.Delivery, pub *brok
 func (h *Handler) HandleStatus(ctx context.Context, d amqp.Delivery, pub *broker.Publisher) {
 	var q messages.QueryBankTransferStatus
 	if err := json.Unmarshal(d.Body, &q); err != nil || q.PaymentID == "" {
-		h.Log.Error("malformed status query, dead-lettering", "messageId", d.MessageId, "error", err)
+		h.Log.ErrorContext(ctx, "malformed status query, dead-lettering", "messageId", d.MessageId, "error", err)
 		_ = d.Nack(false, false)
+		settled(ctx, messages.StatusQueue, "malformed", false)
 		return
 	}
 	log := h.Log.With("paymentId", q.PaymentID, "inquiry", q.Inquiry)
 
 	result := messages.BankTransferResult{MessageID: uuid.NewString(), PaymentID: q.PaymentID, CompletedAt: time.Now().UTC()}
+	started := time.Now()
 	res, found, err := h.Bank.Status(ctx, q.PaymentID)
 	switch {
 	case err != nil:
-		log.Warn("status inquiry failed", "error", err)
+		log.WarnContext(ctx, "status inquiry failed", "error", err)
 		result.Outcome = messages.OutcomeUnknown
 	case !found:
 		result.Outcome = messages.OutcomeNotFound
@@ -86,10 +97,15 @@ func (h *Handler) HandleStatus(ctx context.Context, d amqp.Delivery, pub *broker
 	default:
 		result.Outcome, result.BankReference, result.ReasonCode = messages.OutcomeRejected, res.BankReference, res.ReasonCode
 	}
-	h.publishResult(ctx, d, pub, log, result)
+	if err != nil {
+		bankCall(ctx, "status", "error", started)
+	} else {
+		bankCall(ctx, "status", strings.ToLower(result.Outcome), started)
+	}
+	h.publishResult(ctx, messages.StatusQueue, d, pub, log, result)
 }
 
-func (h *Handler) publishResult(ctx context.Context, d amqp.Delivery, pub *broker.Publisher, log *slog.Logger, r messages.BankTransferResult) {
+func (h *Handler) publishResult(ctx context.Context, queue string, d amqp.Delivery, pub *broker.Publisher, log *slog.Logger, r messages.BankTransferResult) {
 	body, _ := json.Marshal(r)
 	pctx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
@@ -101,22 +117,22 @@ func (h *Handler) publishResult(ctx context.Context, d amqp.Delivery, pub *broke
 		ContentType:   "application/json",
 		DeliveryMode:  amqp.Persistent,
 		Timestamp:     time.Now().UTC(),
-		Headers:       traceHeaders(d),
 		Body:          body,
 	})
 	if err != nil {
 		// Not acked: the command is redelivered and the bank call repeated (idempotent at the bank).
-		log.Error("publishing result failed, requeueing command", "error", err)
+		log.ErrorContext(ctx, "publishing result failed, requeueing command", "error", err)
 		_ = d.Nack(false, true)
+		settled(ctx, queue, "requeued", false)
 		return
 	}
 	_ = d.Ack(false)
-	log.Info("bank result published", "outcome", r.Outcome, "bankReference", r.BankReference, "reason", r.ReasonCode)
+	settled(ctx, queue, "published", true)
+	log.InfoContext(ctx, "bank result published", "outcome", r.Outcome, "bankReference", r.BankReference, "reason", r.ReasonCode)
 }
 
 func (h *Handler) retry(ctx context.Context, d amqp.Delivery, attempt int, pub *broker.Publisher, log *slog.Logger) {
-	headers := traceHeaders(d)
-	headers[messages.HeaderAttempt] = int32(attempt + 1)
+	headers := amqp.Table{messages.HeaderAttempt: int32(attempt + 1)}
 	pctx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
 
@@ -131,21 +147,13 @@ func (h *Handler) retry(ctx context.Context, d amqp.Delivery, attempt int, pub *
 		Body:          d.Body,
 	})
 	if err != nil {
-		log.Error("scheduling retry failed, requeueing", "error", err)
+		log.ErrorContext(ctx, "scheduling retry failed, requeueing", "error", err)
 		_ = d.Nack(false, true)
+		settled(ctx, messages.TransfersQueue, "requeued", false)
 		return
 	}
 	_ = d.Ack(false)
-}
-
-func traceHeaders(d amqp.Delivery) amqp.Table {
-	h := amqp.Table{}
-	for _, k := range []string{messages.HeaderTraceParent, messages.HeaderTraceState} {
-		if v, ok := d.Headers[k]; ok {
-			h[k] = v
-		}
-	}
-	return h
+	settled(ctx, messages.TransfersQueue, "retry_scheduled", false)
 }
 
 func attemptOf(d amqp.Delivery) int {

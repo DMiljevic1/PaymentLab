@@ -1,4 +1,4 @@
-﻿# Shared Dockerfile for the .NET services. Build with --build-arg PROJECT=Payments|Wallet|Gateway
+# Shared Dockerfile for the .NET services. Build with --build-arg PROJECT=Payments|Wallet|Gateway
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG PROJECT
 WORKDIR /src

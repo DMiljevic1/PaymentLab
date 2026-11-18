@@ -9,6 +9,11 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Handler processes one delivery and must ack or nack it.
@@ -20,7 +25,36 @@ type Publisher struct {
 }
 
 // Publish waits until the broker confirmed the message (or ctx expires).
-func (p *Publisher) Publish(ctx context.Context, exchange, key string, msg amqp.Publishing) error {
+// It runs in a producer span whose context is injected into the message headers.
+func (p *Publisher) Publish(ctx context.Context, exchange, key string, msg amqp.Publishing) (err error) {
+	ctx, span := tracer.Start(ctx, exchange+" publish",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "rabbitmq"),
+			attribute.String("messaging.operation.type", "send"),
+			attribute.String("messaging.destination.name", exchange),
+			attribute.String("messaging.rabbitmq.destination.routing_key", key),
+			attribute.String("messaging.message.id", msg.MessageId),
+		))
+	started := time.Now()
+	defer func() {
+		result := "confirmed"
+		if err != nil {
+			result = "failed"
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		attrs := metric.WithAttributes(attribute.String("exchange", exchange), attribute.String("result", result))
+		publishes.Add(ctx, 1, attrs)
+		publishDuration.Record(ctx, time.Since(started).Seconds(), attrs)
+		span.End()
+	}()
+
+	if msg.Headers == nil {
+		msg.Headers = amqp.Table{}
+	}
+	otel.GetTextMapPropagator().Inject(ctx, HeaderCarrier(msg.Headers))
+
 	dc, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, false, false, msg)
 	if err != nil {
 		return err
@@ -61,6 +95,7 @@ func (s *Session) Run(ctx context.Context, drainTimeout time.Duration) {
 			return
 		}
 		s.Log.Warn("amqp session ended, reconnecting", "error", err, "backoff", backoff.String())
+		reconnects.Add(ctx, 1)
 		select {
 		case <-ctx.Done():
 			return
@@ -114,16 +149,26 @@ func (s *Session) runOnce(ctx context.Context, drainTimeout time.Duration) error
 			return fmt.Errorf("consume %s: %w", c.Queue, err)
 		}
 		dispatchers.Add(1)
-		go func(h Handler) {
+		go func(c Consumer) {
 			defer dispatchers.Done()
+			queueAttr := metric.WithAttributes(attribute.String("queue", c.Queue))
 			for d := range deliveries { // ends when the consumer is cancelled or the connection closes
 				wg.Add(1)
+				deliveriesReceived.Add(handlerCtx, 1, queueAttr)
 				go func() {
 					defer wg.Done()
-					h(handlerCtx, d, pub)
+					inflight.Add(handlerCtx, 1, queueAttr)
+					started := time.Now()
+					ctx, span := startConsumerSpan(handlerCtx, c.Queue, d)
+					defer func() {
+						span.End()
+						inflight.Add(handlerCtx, -1, queueAttr)
+						processingDuration.Record(handlerCtx, time.Since(started).Seconds(), queueAttr)
+					}()
+					c.Handler(ctx, d, pub)
 				}()
 			}
-		}(c.Handler)
+		}(c)
 	}
 
 	s.Log.Info("amqp session started", "prefetch", s.Prefetch)

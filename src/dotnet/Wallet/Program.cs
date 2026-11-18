@@ -8,7 +8,10 @@ var builder = WebApplication.CreateBuilder(args);
 builder.AddServiceDefaults("wallet");
 
 builder.Services.AddDbContext<WalletDbContext>(o => o
-    .UseNpgsql(builder.Configuration.GetConnectionString("Wallet"))
+    .UseNpgsql(builder.Configuration.GetConnectionString("Wallet"), npgsql => npgsql
+        .ConfigureDataSource(ds => ds.ConfigureTracing(t => t
+            .ConfigureCommandSpanNameProvider(cmd => SqlSpanName.From(cmd.CommandText))
+            .ConfigureCommandEnrichmentCallback((activity, _) => activity.SetTag("peer.service", "wallet-db")))))
     .UseSnakeCaseNamingConvention());
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddScoped<WalletService>();

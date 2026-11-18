@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     PaymentLab control script.
 
@@ -35,7 +35,12 @@ Set-Location $Root
 function Invoke-Compose {
     $envArgs = @('--env-file', (Join-Path $Root '.env'))
     if ($EnvFile) { $envArgs += @('--env-file', (Resolve-Path $EnvFile).Path) }
-    & docker compose @envArgs @args
+    # docker writes progress to stderr; in Windows PowerShell 5.1 with ErrorActionPreference=Stop that would
+    # abort the script when output is redirected, so only the exit code decides about failure.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & docker compose @envArgs @args 2>&1 | ForEach-Object { "$_" } }
+    finally { $ErrorActionPreference = $prev }
     if ($LASTEXITCODE -ne 0) { throw "docker compose $($args -join ' ') failed with exit code $LASTEXITCODE" }
 }
 
@@ -45,12 +50,15 @@ function Test-Docker {
 }
 
 $Endpoints = [ordered]@{
+    'Grafana'          = 'http://localhost:3000  (dashboards: PaymentLab folder; admin / admin to edit)'
     'Gateway (API)'    = 'http://localhost:8080'
     'Payments Swagger' = 'http://localhost:8081/swagger'
     'Wallet Swagger'   = 'http://localhost:8082/swagger'
     'Fake Bank config' = 'http://localhost:8090/admin/config'
     'RabbitMQ UI'      = 'http://localhost:15672  (lab / lab)'
     'Toxiproxy API'    = 'http://localhost:8474/proxies'
+    'Prometheus'       = 'http://localhost:9090'
+    'cAdvisor'         = 'http://localhost:8088'
     'Postgres'         = 'payments: localhost:5432, wallet: localhost:5433 (user = password = db name)'
 }
 
@@ -60,6 +68,10 @@ $HealthChecks = [ordered]@{
     wallet    = 'http://localhost:8082/ready'
     connector = 'http://localhost:8085/ready'
     fakebank  = 'http://localhost:8090/healthz'
+    grafana   = 'http://localhost:3000/api/health'
+    prometheus = 'http://localhost:9090/-/ready'
+    loki      = 'http://localhost:3100/ready'
+    tempo     = 'http://localhost:3200/ready'
 }
 
 function Test-Url([string]$Url) {
@@ -118,7 +130,7 @@ switch ($Command) {
         Write-Host 'Readiness:' -ForegroundColor Cyan
         foreach ($k in $HealthChecks.Keys) {
             $ok = Test-Url $HealthChecks[$k]
-            Write-Host ("  {0,-10} {1}" -f $k, $(if ($ok) { 'ready' } else { 'NOT READY' })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
+            Write-Host ("  {0,-11} {1}" -f $k, $(if ($ok) { 'ready' } else { 'NOT READY' })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
         }
         Write-Host ''
         Write-Host 'Resource usage:' -ForegroundColor Cyan

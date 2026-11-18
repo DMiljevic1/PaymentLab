@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using Payments.Data;
+using Payments.Observability;
 using Payments.Saga;
 using PaymentLab.Contracts;
 
@@ -135,14 +136,23 @@ public static class PaymentEndpoints
             return Replay(winner.Payment, winner.State, hash);
         }
 
+        PaymentsTelemetry.PaymentsCreated.Add(1, new KeyValuePair<string, object?>("type", payment.Type.ToString()));
+        Activity.Current?.SetTag("payment.id", payment.Id);
+        Activity.Current?.SetTag("payment.type", payment.Type.ToString());
         signals.SagaReady(payment.Id);
         return Results.Accepted($"/payments/{payment.Id}", ToResponse(payment, saga.State));
     }
 
-    private static IResult Replay(Payment payment, SagaState state, string hash) =>
-        payment.RequestHash == hash
+    private static IResult Replay(Payment payment, SagaState state, string hash)
+    {
+        var same = payment.RequestHash == hash;
+        PaymentsTelemetry.IdempotentReplays.Add(1, new KeyValuePair<string, object?>("result", same ? "replayed" : "mismatch"));
+        Activity.Current?.SetTag("payment.id", payment.Id);
+        Activity.Current?.SetTag("payment.idempotent_replay", true);
+        return same
             ? Results.Ok(ToResponse(payment, state))
             : Results.Problem($"{IdempotencyHeader} was already used with a different request", statusCode: 422);
+    }
 
     private sealed class Row
     {

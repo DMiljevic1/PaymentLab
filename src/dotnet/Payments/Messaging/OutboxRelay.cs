@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Payments.Data;
+using Payments.Observability;
 using Payments.Saga;
 using PaymentLab.Contracts;
 using PaymentLab.ServiceDefaults;
@@ -43,6 +45,7 @@ public sealed class OutboxRelay(
             }
             catch (Exception ex)
             {
+                PaymentsTelemetry.OutboxPublishErrors.Add(1);
                 logger.LogError("Outbox relay error: {Error}", ex.Message);
                 if (channel is { IsClosed: true })
                 {
@@ -95,12 +98,29 @@ public sealed class OutboxRelay(
                 Timestamp = new AmqpTimestamp(clock.GetUtcNow().ToUnixTimeSeconds()),
                 Headers = new Dictionary<string, object?> { [MessageHeaders.Attempt] = 1 },
             };
-            if (msg.TraceParent is not null) props.Headers[MessageHeaders.TraceParent] = msg.TraceParent;
 
-            // mandatory: an unroutable message is returned and the publish fails instead of being silently dropped
-            await channel.BasicPublishAsync(msg.Exchange, msg.RoutingKey, mandatory: true, props,
-                Encoding.UTF8.GetBytes(msg.Payload), ct);
+            // Producer span in the payment's trace; its context travels in the message headers.
+            using (var activity = PaymentsTelemetry.Source.StartActivity($"{msg.Exchange} publish", ActivityKind.Producer,
+                       Telemetry.ParentFrom(msg.TraceParent)))
+            {
+                activity?.SetTag("messaging.system", "rabbitmq");
+                activity?.SetTag("messaging.operation.type", "send");
+                activity?.SetTag("messaging.destination.name", msg.Exchange);
+                activity?.SetTag("messaging.rabbitmq.destination.routing_key", msg.RoutingKey);
+                activity?.SetTag("messaging.message.id", msg.MessageId.ToString());
+                activity?.SetTag("payment.id", msg.PaymentId);
+                var traceParent = activity?.Id ?? msg.TraceParent;
+                if (traceParent is not null) props.Headers[MessageHeaders.TraceParent] = traceParent;
+                if (activity?.TraceStateString is { Length: > 0 } ts) props.Headers[MessageHeaders.TraceState] = ts;
+
+                // mandatory: an unroutable message is returned and the publish fails instead of being silently dropped
+                await channel.BasicPublishAsync(msg.Exchange, msg.RoutingKey, mandatory: true, props,
+                    Encoding.UTF8.GetBytes(msg.Payload), ct);
+            }
             msg.PublishedAt = clock.GetUtcNow();
+            PaymentsTelemetry.OutboxPublished.Add(1, new KeyValuePair<string, object?>("type", msg.Type));
+            PaymentsTelemetry.OutboxLag.Record((msg.PublishedAt.Value - msg.CreatedAt).TotalSeconds,
+                new KeyValuePair<string, object?>("type", msg.Type));
         }
 
         await db.SaveChangesAsync(ct);
