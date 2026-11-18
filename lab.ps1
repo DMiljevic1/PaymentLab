@@ -9,13 +9,18 @@
     ./lab.ps1 smoke              # end-to-end smoke test
     ./lab.ps1 seed medium        # replace DB contents with synthetic history (small | medium | large)
     ./lab.ps1 load steady 50 10m # k6 load test (steady | ramp | spike | soak) [rate/s] [duration]
+    ./lab.ps1 incident           # start a random incident and print the ticket
+    ./lab.ps1 incident -Id 3     # a specific incident (also: --id 3, -Difficulty easy|medium|hard)
+    ./lab.ps1 hint               # one more hint (max 3)
+    ./lab.ps1 reveal             # show the root cause
+    ./lab.ps1 resolve            # remove the fault, restore the system, run the smoke test
     ./lab.ps1 down               # stop (keeps data)
     ./lab.ps1 reset              # stop and wipe all data, then start fresh
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('up', 'down', 'reset', 'status', 'logs', 'smoke', 'seed', 'load', 'urls', 'help')]
+    [ValidateSet('up', 'down', 'reset', 'status', 'logs', 'smoke', 'seed', 'load', 'incident', 'hint', 'reveal', 'resolve', 'urls', 'help')]
     [string]$Command = 'help',
 
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
@@ -25,7 +30,12 @@ param(
     [string]$EnvFile,
 
     # Skip confirmation prompts (reset, seed)
-    [switch]$Force
+    [switch]$Force,
+
+    # incident: pick a specific scenario, or one of a difficulty
+    [int]$Id = 0,
+    [ValidateSet('', 'easy', 'medium', 'hard')]
+    [string]$Difficulty = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -267,6 +277,17 @@ switch ($Command) {
     'load' {
         Test-Docker
         Invoke-Load $Rest
+    }
+    { $_ -in @('incident', 'hint', 'reveal', 'resolve') } {
+        Test-Docker
+        # also accept the --id N / --difficulty X spelling
+        for ($i = 0; $Rest -and $i -lt $Rest.Count - 1; $i++) {
+            if ($Rest[$i] -eq '--id') { $Id = [int]$Rest[$i + 1] }
+            if ($Rest[$i] -eq '--difficulty') { $Difficulty = $Rest[$i + 1] }
+        }
+        $gm = @{ Command = $Command; Id = $Id; Difficulty = $Difficulty }
+        if ($EnvFile) { $gm.EnvFile = $EnvFile }
+        & (Join-Path $Root 'chaos/gm.ps1') @gm
     }
     'urls' { Show-Urls }
     default { Get-Help $PSCommandPath -Detailed | Out-Host }

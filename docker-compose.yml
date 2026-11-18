@@ -207,6 +207,7 @@ services:
       - wallet-db-data:/var/lib/postgresql
       - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
       - ./seed:/seed:ro
+      - ./chaos/sql:/opt/lab:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
       interval: 5s
@@ -430,6 +431,7 @@ services:
       K6_OTEL_EXPORT_INTERVAL: 5s
     volumes:
       - ./load:/load
+      - ./chaos/k6:/extra:ro
     working_dir: /load/k6
     deploy:
       resources:

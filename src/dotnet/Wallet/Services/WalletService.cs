@@ -46,16 +46,12 @@ public sealed class WalletService(WalletDbContext db, TimeProvider clock, ILogge
         if (existing is not null)
             return MapExisting(existing, accountId, amountMinor);
 
-        var account = await db.Accounts
-            .FromSql($"SELECT *, xmin FROM accounts WHERE id = {accountId} FOR UPDATE")
-            .SingleOrDefaultAsync(ct);
+        var account = await db.Accounts.AsNoTracking().SingleOrDefaultAsync(a => a.Id == accountId, ct);
         if (account is null) return ReserveResult.AccountNotFound;
         if (!string.Equals(account.Currency, currency, StringComparison.OrdinalIgnoreCase)) return ReserveResult.CurrencyMismatch;
         if (account.AvailableMinor < amountMinor) return ReserveResult.InsufficientFunds;
 
         var now = clock.GetUtcNow();
-        account.ReservedMinor += amountMinor;
-        account.UpdatedAt = now;
         db.Reservations.Add(new Reservation
         {
             PaymentId = paymentId,
@@ -70,6 +66,10 @@ public sealed class WalletService(WalletDbContext db, TimeProvider clock, ILogge
         try
         {
             await db.SaveChangesAsync(ct);
+            // Increment in SQL rather than read-modify-write, so concurrent reservations never overwrite each other.
+            await db.Accounts.Where(a => a.Id == accountId).ExecuteUpdateAsync(s => s
+                .SetProperty(a => a.ReservedMinor, a => a.ReservedMinor + amountMinor)
+                .SetProperty(a => a.UpdatedAt, now), ct);
             await tx.CommitAsync(ct);
             return ReserveResult.Reserved;
         }

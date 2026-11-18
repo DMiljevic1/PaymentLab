@@ -3,6 +3,7 @@
 //	POST /v1/transfers        (header Idempotency-Key)  -> 201 new / 200 replay
 //	GET  /v1/transfers/{key}                            -> 200 / 404
 //	GET  /admin/config, POST /admin/config (partial JSON update)
+//	                    maxRequestsPerSecond > 0 makes POST /v1/transfers answer 429 above that rate
 //	GET  /healthz
 //
 // Deterministic test hook: a creditor IBAN ending in "9999" is always rejected (AC04, closed account).
@@ -31,13 +32,35 @@ import (
 )
 
 type Config struct {
-	LatencyMs        int     `json:"latencyMs"`        // base processing time
-	JitterMs         int     `json:"jitterMs"`         // + uniform random 0..jitter
-	RejectRate       float64 `json:"rejectRate"`       // probability of a business rejection (AG01)
-	ErrorRate        float64 `json:"errorRate"`        // probability of HTTP 503 (nothing stored)
-	SlowRate         float64 `json:"slowRate"`         // probability of a very slow response (transfer IS executed)
-	SlowMs           int     `json:"slowMs"`           // duration of a slow response
-	RetentionMinutes int     `json:"retentionMinutes"` // how long transfers are kept for status queries
+	LatencyMs         int     `json:"latencyMs"`            // base processing time
+	JitterMs          int     `json:"jitterMs"`             // + uniform random 0..jitter
+	RejectRate        float64 `json:"rejectRate"`           // probability of a business rejection (AG01)
+	ErrorRate         float64 `json:"errorRate"`            // probability of HTTP 503 (nothing stored)
+	SlowRate          float64 `json:"slowRate"`             // probability of a very slow response (transfer IS executed)
+	SlowMs            int     `json:"slowMs"`               // duration of a slow response
+	RetentionMinutes  int     `json:"retentionMinutes"`     // how long transfers are kept for status queries
+	MaxRequestsPerSec int     `json:"maxRequestsPerSecond"` // 0 = unlimited; above it POST /v1/transfers returns 429
+}
+
+// rateWindow is a fixed one-second window counter (good enough for a simulated bank).
+type rateWindow struct {
+	mu     sync.Mutex
+	second int64
+	count  int
+}
+
+func (w *rateWindow) allow(max int) bool {
+	if max <= 0 {
+		return true
+	}
+	now := time.Now().Unix()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if now != w.second {
+		w.second, w.count = now, 0
+	}
+	w.count++
+	return w.count <= max
 }
 
 type Transfer struct {
@@ -67,6 +90,7 @@ type bank struct {
 	transfers map[string]*Transfer
 	seq       atomic.Int64
 	log       *slog.Logger
+	window    rateWindow
 }
 
 var (
@@ -94,13 +118,14 @@ func main() {
 			return nil
 		}))
 	cfg := Config{
-		LatencyMs:        envInt("FAKEBANK_LATENCY_MS", 50),
-		JitterMs:         envInt("FAKEBANK_JITTER_MS", 50),
-		RejectRate:       envFloat("FAKEBANK_REJECT_RATE", 0.02),
-		ErrorRate:        envFloat("FAKEBANK_ERROR_RATE", 0),
-		SlowRate:         envFloat("FAKEBANK_SLOW_RATE", 0),
-		SlowMs:           envInt("FAKEBANK_SLOW_MS", 10000),
-		RetentionMinutes: envInt("FAKEBANK_RETENTION_MINUTES", 60),
+		LatencyMs:         envInt("FAKEBANK_LATENCY_MS", 50),
+		JitterMs:          envInt("FAKEBANK_JITTER_MS", 50),
+		RejectRate:        envFloat("FAKEBANK_REJECT_RATE", 0.02),
+		ErrorRate:         envFloat("FAKEBANK_ERROR_RATE", 0),
+		SlowRate:          envFloat("FAKEBANK_SLOW_RATE", 0),
+		SlowMs:            envInt("FAKEBANK_SLOW_MS", 10000),
+		RetentionMinutes:  envInt("FAKEBANK_RETENTION_MINUTES", 60),
+		MaxRequestsPerSec: envInt("FAKEBANK_MAX_REQUESTS_PER_SECOND", 0),
 	}
 	b.cfg.Store(&cfg)
 
@@ -147,6 +172,13 @@ func (b *bank) createTransfer(w http.ResponseWriter, r *http.Request) {
 	var req transferRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.AmountMinor <= 0 || req.CreditorIban == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid transfer request"})
+		return
+	}
+
+	if !b.window.allow(b.cfg.Load().MaxRequestsPerSec) {
+		transfersCount.Add(r.Context(), 1, metric.WithAttributes(attribute.String("result", "throttled")))
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
 		return
 	}
 
